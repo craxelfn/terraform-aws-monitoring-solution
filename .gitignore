@@ -1,0 +1,19 @@
+*.tfstate
+*.tfstate.backup
+
+crash.log
+
+*.tfvars
+
+# terraform.tfvars
+# terraform.tfvars.json
+
+*.tfplan
+
+*.zip
+*.pyc
+__pycache__/
+
+.vscode/
+.idea/
+*.iml
