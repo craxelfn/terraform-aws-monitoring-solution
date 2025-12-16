@@ -1,105 +1,83 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
 provider "aws" {
   region = var.region
 }
 
-# Used for unique naming of buckets
-resource "random_id" "uid" {
+# --- 1. SNS Topic for Alerts (Day 2 Prep) ---
+resource "aws_sns_topic" "alerts" {
+  name = "${var.project_name}-alerts-topic"
+}
+
+resource "aws_sns_topic_subscription" "email_sub" {
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# --- 2. S3 Bucket for Frontend ---
+# Adding randomness because bucket names must be globally unique
+resource "random_id" "bucket_suffix" {
   byte_length = 4
 }
 
-# Get current account ID for policies
-data "aws_caller_identity" "current" {}
-
-# ==============================================================================
-# 1. FRONTEND (S3 + CloudFront)
-# ==============================================================================
-
-resource "aws_s3_bucket" "frontend_bucket" {
-  bucket        = "${var.project_name}-frontend-${random_id.uid.hex}"
+resource "aws_s3_bucket" "frontend" {
+  bucket        = "${var.project_name}-frontend-${random_id.bucket_suffix.hex}"
   force_destroy = true
 }
 
-# Origin Access Control (Secure way for CF to access S3)
-resource "aws_cloudfront_origin_access_control" "default" {
-  name                              = "default"
-  description                       = "OAC for Frontend"
-  origin_access_control_origin_type = "s3"
-  signing_behavior                  = "always"
-  signing_protocol                  = "sigv4"
+resource "aws_s3_bucket_website_configuration" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+  index_document { suffix = "index.html" }
 }
 
-resource "aws_cloudfront_distribution" "cdn" {
-  enabled             = true
-  default_root_object = "index.html"
-
-  origin {
-    domain_name              = aws_s3_bucket.frontend_bucket.bucket_regional_domain_name
-    origin_id                = "S3Origin"
-    origin_access_control_id = aws_cloudfront_origin_access_control.default.id
-  }
-
-  default_cache_behavior {
-    allowed_methods  = ["GET", "HEAD"]
-    cached_methods   = ["GET", "HEAD"]
-    target_origin_id = "S3Origin"
-
-    forwarded_values {
-      query_string = false
-      cookies { forward = "none" }
-    }
-    viewer_protocol_policy = "redirect-to-https"
-  }
-
-  restrictions {
-    geo_restriction { restriction_type = "none" }
-  }
-
-  viewer_certificate {
-    cloudfront_default_certificate = true
-  }
+resource "aws_s3_bucket_public_access_block" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
 }
 
-# Policy allowing CloudFront to read S3
-resource "aws_s3_bucket_policy" "frontend_policy" {
-  bucket = aws_s3_bucket.frontend_bucket.id
+resource "aws_s3_bucket_policy" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid    = "AllowCloudFrontServicePrincipal"
-      Effect = "Allow"
-      Principal = { Service = "cloudfront.amazonaws.com" }
-      Action   = "s3:GetObject"
-      Resource = "${aws_s3_bucket.frontend_bucket.arn}/*"
-      Condition = {
-        StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.cdn.arn }
-      }
+      Sid       = "PublicReadGetObject"
+      Effect    = "Allow"
+      Principal = "*"
+      Action    = "s3:GetObject"
+      Resource  = "${aws_s3_bucket.frontend.arn}/*"
     }]
   })
+  depends_on = [aws_s3_bucket_public_access_block.frontend]
 }
 
-# Upload index.html
 resource "aws_s3_object" "index" {
-  bucket       = aws_s3_bucket.frontend_bucket.id
+  bucket       = aws_s3_bucket.frontend.id
   key          = "index.html"
-  source       = "app/frontend/index.html"
+  source       = "${path.module}/app/frontend/index.html"
   content_type = "text/html"
+  etag         = filemd5("${path.module}/app/frontend/index.html")
 }
 
-# ==============================================================================
-# 2. BACKEND (Lambda + API Gateway)
-# ==============================================================================
-
-# Zip the code
+# --- 3. Lambda Function (Backend) ---
 data "archive_file" "lambda_zip" {
   type        = "zip"
-  source_dir  = "app/backend"
-  output_path = "backend.zip"
+  source_file = "${path.module}/app/backend/index.js"
+  output_path = "${path.module}/app/backend/lambda.zip"
 }
 
-# IAM Role for Lambda (Logs + X-Ray Tracing)
 resource "aws_iam_role" "lambda_role" {
   name = "${var.project_name}-lambda-role"
-
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -110,8 +88,7 @@ resource "aws_iam_role" "lambda_role" {
   })
 }
 
-# Attach Basic Execution (CloudWatch Logs) and X-Ray permissions
-resource "aws_iam_role_policy_attachment" "lambda_basic" {
+resource "aws_iam_role_policy_attachment" "lambda_logs" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
@@ -121,137 +98,84 @@ resource "aws_iam_role_policy_attachment" "lambda_xray" {
   policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
 }
 
-resource "aws_lambda_function" "backend" {
+resource "aws_lambda_function" "api_backend" {
   filename         = data.archive_file.lambda_zip.output_path
-  function_name    = "${var.project_name}-function"
+  function_name    = "${var.project_name}-backend"
   role             = aws_iam_role.lambda_role.arn
   handler          = "index.handler"
   runtime          = "nodejs18.x"
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 
   tracing_config {
-    mode = "Active" # Enables X-Ray
+    mode = "Active"
   }
 }
 
-# API Gateway (REST)
-resource "aws_api_gateway_rest_api" "api" {
-  name = "${var.project_name}-api"
+# --- 4. API Gateway ---
+resource "aws_apigatewayv2_api" "main" {
+  name          = "${var.project_name}-api"
+  protocol_type = "HTTP"
+  cors_configuration {
+    allow_origins = ["*"]
+    allow_methods = ["POST", "OPTIONS"]
+    allow_headers = ["content-type"]
+  }
 }
 
-resource "aws_api_gateway_resource" "resource" {
-  path_part   = "hello"
-  parent_id   = aws_api_gateway_rest_api.api.root_resource_id
-  rest_api_id = aws_api_gateway_rest_api.api.id
+resource "aws_cloudwatch_log_group" "api_gw" {
+  name              = "/aws/api-gw/${var.project_name}"
+  retention_in_days = 7
 }
 
-resource "aws_api_gateway_method" "method" {
-  rest_api_id   = aws_api_gateway_rest_api.api.id
-  resource_id   = aws_api_gateway_resource.resource.id
-  http_method   = "GET"
-  authorization = "NONE"
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.main.id
+  name        = "$default"
+  auto_deploy = true
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.api_gw.arn
+    format          = "$context.identity.sourceIp - - [$context.requestTime] \"$context.httpMethod $context.routeKey $context.protocol\" $context.status $context.responseLength $context.requestId"
+  }
 }
 
-resource "aws_api_gateway_integration" "integration" {
-  rest_api_id             = aws_api_gateway_rest_api.api.id
-  resource_id             = aws_api_gateway_resource.resource.id
-  http_method             = aws_api_gateway_method.method.http_method
-  integration_http_method = "POST"
-  type                    = "AWS_PROXY"
-  uri                     = aws_lambda_function.backend.invoke_arn
+resource "aws_apigatewayv2_integration" "lambda" {
+  api_id           = aws_apigatewayv2_api.main.id
+  integration_type = "AWS_PROXY"
+  integration_uri  = aws_lambda_function.api_backend.invoke_arn
 }
 
-resource "aws_lambda_permission" "apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
+resource "aws_apigatewayv2_route" "post_route" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_lambda_permission" "api_gw" {
+  statement_id  = "AllowExecutionFromAPIGateway"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.backend.function_name
+  function_name = aws_lambda_function.api_backend.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_api_gateway_rest_api.api.execution_arn}/*/*"
+  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
 }
 
-resource "aws_api_gateway_deployment" "deployment" {
-  depends_on  = [aws_api_gateway_integration.integration]
-  rest_api_id = aws_api_gateway_rest_api.api.id
-}
 
-resource "aws_api_gateway_stage" "prod" {
-  deployment_id = aws_api_gateway_deployment.deployment.id
-  rest_api_id   = aws_api_gateway_rest_api.api.id
-  stage_name    = "prod"
-  
-  # Enable X-Ray Tracing for API Gateway
-  xray_tracing_enabled = true
-}
-
-# ==============================================================================
-# 3. OBSERVABILITY (Alerting & Auditing)
-# ==============================================================================
-
-# --- Alerting (SNS + CloudWatch Alarm) ---
-resource "aws_sns_topic" "alerts" {
-  name = "${var.project_name}-alerts"
-}
-
-resource "aws_sns_topic_subscription" "email_sub" {
-  topic_arn = aws_sns_topic.alerts.arn
-  protocol  = "email"
-  endpoint  = var.alert_email
-}
-
-resource "aws_cloudwatch_metric_alarm" "api_errors" {
-  alarm_name          = "${var.project_name}-5xx-errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = "1"
-  metric_name         = "5XXError"
-  namespace           = "AWS/ApiGateway"
-  period              = "60"
-  statistic           = "Sum"
-  threshold           = "0" # Alert on any single 5xx error
-  alarm_description   = "This metric monitors API Gateway 5xx errors"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
+resource "aws_cloudwatch_metric_alarm" "lambda_error_alarm" {
+  alarm_name                = "${var.project_name}-backend-error-alarm"
+  comparison_operator       = "GreaterThanOrEqualToThreshold"
+  evaluation_periods        = "1"
+  metric_name               = "Errors"
+  namespace                 = "AWS/Lambda"
+  period                    = "60"
+  statistic                 = "Sum"
+  threshold                 = "1"
+  alarm_description         = "This alarm triggers when the Backend Lambda fails."
+  insufficient_data_actions = []
   
   dimensions = {
-    ApiName = aws_api_gateway_rest_api.api.name
-    Stage   = aws_api_gateway_stage.prod.stage_name
+    FunctionName = aws_lambda_function.api_backend.function_name
   }
-}
 
-# --- Auditing (CloudTrail) ---
-resource "aws_s3_bucket" "trail_bucket" {
-  bucket        = "${var.project_name}-trail-${random_id.uid.hex}"
-  force_destroy = true
-}
-
-resource "aws_s3_bucket_policy" "trail_policy" {
-  bucket = aws_s3_bucket.trail_bucket.id
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Sid    = "AWSCloudTrailAclCheck",
-        Effect = "Allow",
-        Principal = { Service = "cloudtrail.amazonaws.com" },
-        Action   = "s3:GetBucketAcl",
-        Resource = aws_s3_bucket.trail_bucket.arn
-      },
-      {
-        Sid    = "AWSCloudTrailWrite",
-        Effect = "Allow",
-        Principal = { Service = "cloudtrail.amazonaws.com" },
-        Action   = "s3:PutObject",
-        Resource = "${aws_s3_bucket.trail_bucket.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*",
-        Condition = {
-          StringEquals = { "s3:x-amz-acl" = "bucket-owner-full-control" }
-        }
-      }
-    ]
-  })
-}
-
-resource "aws_cloudtrail" "audit" {
-  name                          = "${var.project_name}-trail"
-  s3_bucket_name                = aws_s3_bucket.trail_bucket.id
-  include_global_service_events = true
-  is_multi_region_trail         = false
-  enable_logging                = true
+  # Link to the SNS Topic (Email)
+  alarm_actions = [aws_sns_topic.alerts.arn]
+  ok_actions    = [aws_sns_topic.alerts.arn] # Send email when it recovers too
 }
